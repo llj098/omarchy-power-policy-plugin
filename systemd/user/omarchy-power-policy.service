@@ -1,0 +1,14 @@
+[Unit]
+Description=Omarchy AC/battery lid policy
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionFileIsExecutable=%h/.config/omarchy/plugins/fatlj.power-policy/bin/omarchy-power-policy
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=handle-lid-switch --who="Omarchy Power Policy" --why="Apply AC/battery lid policy" --mode=block %h/.config/omarchy/plugins/fatlj.power-policy/bin/omarchy-power-policy
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
