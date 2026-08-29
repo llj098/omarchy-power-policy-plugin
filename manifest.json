@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "fatlj.power-policy",
   "name": "Power Policy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "fatlj",
   "description": "Apply AC/battery lid policy without overriding Omarchy idle or display handling.",
   "kinds": [

@@ -4,8 +4,10 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")" && pwd)
 cd "$repo"
 
-python -m unittest discover -s tests -v
-python -m py_compile bin/omarchy-power-policy
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+./build.sh
 python -m json.tool manifest.json >/dev/null
 
 if command -v qmlformat6 >/dev/null 2>&1; then
@@ -14,6 +16,10 @@ elif [[ -x /usr/lib/qt6/bin/qmlformat ]]; then
   /usr/lib/qt6/bin/qmlformat -n Service.qml >/dev/null
 fi
 
-systemd-analyze --user --man=no verify systemd/user/omarchy-power-policy.service
+unit=$(mktemp --suffix=.service)
+trap 'rm -f -- "$unit"' EXIT
+sed "s|%h/.config/omarchy/plugins/fatlj.power-policy|$repo|g" \
+  systemd/user/omarchy-power-policy.service >"$unit"
+systemd-analyze --user --man=no verify "$unit"
 
-echo "power_policy_tests=ok"
+echo "power_policy_tests=ok implementation=rust"

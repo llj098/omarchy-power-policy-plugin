@@ -6,7 +6,7 @@ ConditionFileIsExecutable=%h/.config/omarchy/plugins/fatlj.power-policy/bin/omar
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/systemd-inhibit --what=handle-lid-switch --who="Omarchy Power Policy" --why="Apply AC/battery lid policy" --mode=block %h/.config/omarchy/plugins/fatlj.power-policy/bin/omarchy-power-policy
+ExecStart=%h/.config/omarchy/plugins/fatlj.power-policy/bin/omarchy-power-policy
 Restart=on-failure
 RestartSec=2
 

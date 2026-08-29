@@ -1,6 +1,6 @@
 # Omarchy Power Policy
 
-Focused Omarchy service plugin for one policy:
+A focused Omarchy service plugin for one policy:
 
 | State transition | Action |
 |---|---|
@@ -9,23 +9,26 @@ Focused Omarchy service plugin for one policy:
 | AC is unplugged while the lid is closed | Suspend |
 | AC is unplugged while the lid is open | No action |
 
-External-monitor state does not override this policy. Omarchy continues to own clamshell display handling, idle/screensaver behavior, and the existing `sleep:delay` lock-before-suspend path.
+External-monitor state does not override this policy. Omarchy continues to own clamshell display handling, idle/screensaver behavior, and its existing `sleep:delay` lock-before-suspend path.
 
 ## Design
 
-`bin/omarchy-power-policy` subscribes to UPower's `OnBattery` and `LidIsClosed` D-Bus properties. The user unit wraps it in a `handle-lid-switch:block` logind inhibitor so logind does not make a competing lid decision. When the policy requires sleep, the daemon calls `org.freedesktop.login1.Manager.Suspend(false)`.
+The single Rust daemon:
 
-There is no polling and no `/etc/systemd/logind.conf` change.
+- directly holds logind's `handle-lid-switch:block` inhibitor FD;
+- subscribes to UPower `OnBattery` and `LidIsClosed` changes without polling;
+- calls `org.freedesktop.login1.Manager.Suspend(false)` when required;
+- rebuilds its D-Bus epoch and inhibitor after logind or UPower owner changes.
 
-## Validation
+There is no Python process, wrapper process, or `/etc/systemd/logind.conf` change.
 
-From the repository:
+## Build and validation
 
 ```bash
 ./test.sh
 ```
 
-A safe live D-Bus read can be checked without acquiring an inhibitor or suspending:
+This creates the runtime binary at `bin/omarchy-power-policy`. A safe live check acquires the real inhibitor but logs suspend decisions instead of executing them:
 
 ```bash
 timeout 3s bin/omarchy-power-policy --dry-run
@@ -33,37 +36,37 @@ timeout 3s bin/omarchy-power-policy --dry-run
 
 ## Logs
 
-The daemon logs only state changes and actions. Under the user service:
-
 ```bash
 journalctl --user -u omarchy-power-policy.service
 ```
 
-Typical records are:
+Typical records:
 
 ```text
-INFO state reason=upower:OnBattery on_battery=True lid_closed=True
-WARNING requesting suspend reason=upower:OnBattery
+INFO inhibitor acquired what=handle-lid-switch mode=block
+INFO state reason=upower:OnBattery on_battery=true lid_closed=true
+WARN requesting suspend reason=upower:OnBattery
 ```
 
 ## Installation
 
-This repository is not deployed automatically. After installing it as `~/.config/omarchy/plugins/fatlj.power-policy`, install and enable the user unit:
+After installing the repository as `~/.config/omarchy/plugins/fatlj.power-policy`, build it and install the user unit:
 
 ```bash
-install -Dm644 \
-  ~/.config/omarchy/plugins/fatlj.power-policy/systemd/user/omarchy-power-policy.service \
+cd ~/.config/omarchy/plugins/fatlj.power-policy
+./build.sh
+install -Dm644 systemd/user/omarchy-power-policy.service \
   ~/.config/systemd/user/omarchy-power-policy.service
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-power-policy.service
 omarchy plugin enable fatlj.power-policy
 ```
 
-Verify that exactly one policy inhibitor exists alongside Omarchy's separate sleep-delay inhibitor:
+Verify the service owns exactly one `handle-lid-switch` inhibitor alongside Omarchy's separate sleep-delay inhibitor:
 
 ```bash
 systemd-inhibit --list
 systemctl --user status omarchy-power-policy.service
 ```
 
-To remove it, disable the plugin and unit, then delete the installed unit file. No vendor files are modified.
+To remove it, disable the plugin and user unit, then delete the installed unit. No vendor files are modified.
