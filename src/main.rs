@@ -18,6 +18,13 @@ struct PolicyEngine {
     unsafe_latched: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum EpochEnd {
+    UpowerOwnerChanged,
+    LogindOwnerChanged,
+    SystemBusEnded,
+}
+
 impl PolicyEngine {
     fn update(&mut self, on_battery: bool, lid_closed: bool) -> bool {
         let unsafe_now = on_battery && lid_closed;
@@ -76,43 +83,23 @@ async fn evaluate(
     Ok(())
 }
 
-async fn run_epoch(dry_run: bool) -> Result<()> {
-    let connection = Connection::system().await?;
-    let upower = Proxy::new(&connection, UPOWER_NAME, UPOWER_PATH, UPOWER_INTERFACE).await?;
-    let logind = Proxy::new(&connection, LOGIND_NAME, LOGIND_PATH, LOGIND_INTERFACE).await?;
-    let properties = fdo::PropertiesProxy::builder(&connection)
+async fn run_upower_epoch(
+    connection: &Connection,
+    logind: &Proxy<'_>,
+    owner_changes: &mut fdo::NameOwnerChangedStream,
+    policy: &mut PolicyEngine,
+    last_observed: &mut Option<(bool, bool)>,
+    dry_run: bool,
+) -> Result<EpochEnd> {
+    let upower = Proxy::new(connection, UPOWER_NAME, UPOWER_PATH, UPOWER_INTERFACE).await?;
+    let properties = fdo::PropertiesProxy::builder(connection)
         .destination(UPOWER_NAME)?
         .path(UPOWER_PATH)?
         .build()
         .await?;
-    let dbus = fdo::DBusProxy::new(&connection).await?;
     let mut property_changes = properties.receive_properties_changed().await?;
-    let mut owner_changes = dbus.receive_name_owner_changed().await?;
 
-    let _inhibitor: OwnedFd = logind
-        .call(
-            "Inhibit",
-            &(
-                "handle-lid-switch",
-                "Omarchy Power Policy",
-                "Apply AC/battery lid policy",
-                "block",
-            ),
-        )
-        .await?;
-    eprintln!("INFO inhibitor acquired what=handle-lid-switch mode=block");
-
-    let mut policy = PolicyEngine::default();
-    let mut last_observed = None;
-    evaluate(
-        &upower,
-        &logind,
-        &mut policy,
-        &mut last_observed,
-        "startup",
-        dry_run,
-    )
-    .await?;
+    evaluate(&upower, logind, policy, last_observed, "startup", dry_run).await?;
 
     loop {
         tokio::select! {
@@ -128,27 +115,83 @@ async fn run_epoch(dry_run: bool) -> Result<()> {
                 );
                 if !relevant.is_empty() {
                     let reason = format!("upower:{}", relevant.join(","));
-                    evaluate(
-                        &upower,
-                        &logind,
-                        &mut policy,
-                        &mut last_observed,
-                        &reason,
-                        dry_run,
-                    ).await?;
+                    evaluate(&upower, logind, policy, last_observed, &reason, dry_run).await?;
                 }
             }
             change = owner_changes.next() => {
-                let change = change.ok_or("D-Bus owner signal stream ended")?;
+                let Some(change) = change else {
+                    return Ok(EpochEnd::SystemBusEnded);
+                };
                 let args = change.args()?;
-                let name = args.name().as_str();
-                if name == UPOWER_NAME || name == LOGIND_NAME {
-                    eprintln!("WARN D-Bus owner changed service={name}; rebuilding policy epoch");
-                    return Ok(());
+                match args.name().as_str() {
+                    UPOWER_NAME => return Ok(EpochEnd::UpowerOwnerChanged),
+                    LOGIND_NAME => return Ok(EpochEnd::LogindOwnerChanged),
+                    _ => {}
                 }
             }
         }
     }
+}
+
+async fn run_daemon_on_connection(connection: Connection, dry_run: bool) -> Result<()> {
+    let logind = Proxy::new(&connection, LOGIND_NAME, LOGIND_PATH, LOGIND_INTERFACE).await?;
+    let dbus = fdo::DBusProxy::new(&connection).await?;
+    let mut owner_changes = dbus.receive_name_owner_changed().await?;
+
+    // This guard must outlive every UPower epoch. Dropping it lets logind act on a
+    // lid that is still closed before the UPower subscription can be rebuilt.
+    let _inhibitor: OwnedFd = logind
+        .call(
+            "Inhibit",
+            &(
+                "handle-lid-switch",
+                "Omarchy Power Policy",
+                "Apply AC/battery lid policy",
+                "block",
+            ),
+        )
+        .await?;
+    eprintln!("INFO inhibitor acquired what=handle-lid-switch mode=block");
+
+    let mut policy = PolicyEngine::default();
+    let mut last_observed = None;
+
+    loop {
+        match run_upower_epoch(
+            &connection,
+            &logind,
+            &mut owner_changes,
+            &mut policy,
+            &mut last_observed,
+            dry_run,
+        )
+        .await
+        {
+            Ok(EpochEnd::UpowerOwnerChanged) => {
+                eprintln!(
+                    "WARN D-Bus owner changed service={UPOWER_NAME}; rebuilding UPower epoch"
+                );
+            }
+            Ok(EpochEnd::LogindOwnerChanged) => {
+                eprintln!(
+                    "WARN D-Bus owner changed service={LOGIND_NAME}; rebuilding daemon epoch"
+                );
+                return Ok(());
+            }
+            Ok(EpochEnd::SystemBusEnded) => {
+                return Err("system D-Bus owner signal stream ended".into());
+            }
+            Err(error) => {
+                eprintln!("ERROR UPower epoch failed: {error}");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_daemon(dry_run: bool) -> Result<()> {
+    run_daemon_on_connection(Connection::system().await?, dry_run).await
 }
 
 fn parse_dry_run() -> std::result::Result<bool, &'static str> {
@@ -202,9 +245,9 @@ async fn main() -> ExitCode {
                 eprintln!("INFO shutting down signal=SIGINT");
                 return ExitCode::SUCCESS;
             }
-            result = run_epoch(dry_run) => {
+            result = run_daemon(dry_run) => {
                 if let Err(error) = result {
-                    eprintln!("ERROR policy epoch failed: {error}");
+                    eprintln!("ERROR daemon epoch failed: {error}");
                 }
             }
         }
@@ -218,55 +261,4 @@ async fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{PolicyEngine, relevant_properties};
-
-    #[test]
-    fn close_on_ac_then_unplug_suspends_once() {
-        let mut policy = PolicyEngine::default();
-        assert!(!policy.update(false, false));
-        assert!(!policy.update(false, true));
-        assert!(policy.update(true, true));
-        assert!(!policy.update(true, true));
-    }
-
-    #[test]
-    fn close_while_on_battery_suspends() {
-        let mut policy = PolicyEngine::default();
-        assert!(!policy.update(true, false));
-        assert!(policy.update(true, true));
-    }
-
-    #[test]
-    fn opening_lid_rearms_policy() {
-        let mut policy = PolicyEngine::default();
-        assert!(policy.update(true, true));
-        assert!(!policy.update(true, false));
-        assert!(policy.update(true, true));
-    }
-
-    #[test]
-    fn plugging_ac_rearms_closed_lid() {
-        let mut policy = PolicyEngine::default();
-        assert!(policy.update(true, true));
-        assert!(!policy.update(false, true));
-        assert!(policy.update(true, true));
-    }
-
-    #[test]
-    fn open_lid_unplug_does_nothing() {
-        let mut policy = PolicyEngine::default();
-        assert!(!policy.update(false, false));
-        assert!(!policy.update(true, false));
-    }
-
-    #[test]
-    fn filters_relevant_property_names() {
-        let changed = ["DaemonVersion", "OnBattery", "LidIsClosed"];
-        let invalidated = ["LidIsClosed"];
-        assert_eq!(
-            relevant_properties(changed.into_iter(), invalidated.into_iter()),
-            ["LidIsClosed", "OnBattery"]
-        );
-    }
-}
+mod tests;
